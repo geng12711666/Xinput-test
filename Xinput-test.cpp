@@ -2,6 +2,10 @@
 //
 
 #include <iostream>
+#include <fstream>
+#include <direct.h> // For _getcwd() on Windows
+#include <limits.h> // For PATH_MAX or MAX_PATH
+
 
 //#ifdef _WIN32
 //#  ifdef USE_ASIO
@@ -22,9 +26,11 @@
 #include <chrono>
 #include <cmath>
 #include "common.h"
+#include <thread>
 //#include <string>
 
-using Clock = std::chrono::high_resolution_clock;
+//using Clock = std::chrono::high_resolution_clock;     // This clock has higher resolution, but the ref epoch time is not guaranteed to be the Unix epoch (which is what python is using)
+using Clock = std::chrono::system_clock;
 using namespace std::chrono_literals;
 
 
@@ -71,20 +77,46 @@ Some notes :
 
 */
 
-bool process_XInput(udp::socket* skt, udp::endpoint* rcv_end);
+bool process_XInput(udp::socket* skt, udp::endpoint* rcv_end, std::ofstream& outputFile, bool& running_flag);
 
-typedef bool (*callback_fp)(udp::socket* skt, udp::endpoint* rcv_end);
+typedef bool (*callback_fp)(udp::socket* skt, udp::endpoint* rcv_end, std::ofstream& outputFile, bool& running_flag);
 
 class timer_wrapper {
-public:
-    timer_wrapper(boost::asio::io_context& io, Clock::duration i, callback_fp fp, udp::socket *skt, udp::endpoint *rcv_end)
-        : interval(i), timer(io), callback(fp), udp_socket(skt), receiver_endpoint(rcv_end)
-    {}
 
-    void run() {
+private:
+    Clock::duration const interval;
+    boost::asio::high_resolution_timer timer;
+    callback_fp callback;
+    udp::socket* udp_socket;
+    udp::endpoint* receiver_endpoint;
+    std::ofstream outputFile;              //  Creates or append to the event-timestamp.csv
+    bool running_flag;
+
+public:
+    timer_wrapper(boost::asio::io_context& io, Clock::duration i, callback_fp fp, udp::socket *skt, udp::endpoint *rcv_end, std::string& filename)
+        : interval(i), timer(io), callback(fp), udp_socket(skt), receiver_endpoint(rcv_end)
+    {
+        // Open or append to the event file
+        outputFile.open(filename + "_cpp-event-timestamp.csv", std::ios::out | std::ios::app); // Creates or append to the event-timestamp.csv
+        //outputFile.open("XXX_event-timestamp.csv", std::ios::out | std::ios::app); // Creates or append to the event-timestamp.csv
+
+        // Write the headers to csv file
+        outputFile << "timestamp, entity(0:controller 1:sensor), event(0:go home 1:start 2:detect),\n";
+
+        // Set the running flag
+        running_flag = false;
+    }
+
+    ~timer_wrapper() {
+        if (outputFile.is_open()) {
+            outputFile.close();   // Close the event timestamp csv file
+        }
+    }
+
+    void run(){
         timer.expires_from_now(interval);
         timer.async_wait([=](boost::system::error_code ec) {
-            if (!ec && callback(udp_socket, receiver_endpoint)) {
+            if (!ec && callback(udp_socket, receiver_endpoint, outputFile, running_flag)) {
                 run();
             }
             else {
@@ -97,13 +129,6 @@ public:
         timer.cancel();
     }
 
-
-private:
-    Clock::duration const interval;
-    boost::asio::high_resolution_timer timer;
-    callback_fp callback;
-    udp::socket *udp_socket;
-    udp::endpoint *receiver_endpoint;
 };
 
 
@@ -117,6 +142,14 @@ private:
 int main(int argc, char* argv[])
 {
     std::cout << "Hello! Program start\n";
+    
+    char buffer[MAX_PATH]; // Or MAX_PATH on Windows
+    if (_getcwd(buffer, sizeof(buffer)) != NULL) {
+        std::cout << "Current working directory: " << buffer << std::endl;
+    }
+    else {
+        std::cerr << "Error getting current working directory" << std::endl;
+    }
 
 
     // Start creating a UDP socket
@@ -124,6 +157,7 @@ int main(int argc, char* argv[])
     std::string serverPort = "17998";
     std::string serverAddr = "10.10.0.162";   // IP for wired baseline
     //std::string serverAddr = "12.1.1.136";      // IP for 5G setup
+    std::string out_filename = "default";
     
     
     // program options   
@@ -133,6 +167,7 @@ int main(int argc, char* argv[])
         ("help,h", "print the help message")
         ("port,p", po::value<std::string>(&serverPort), "server port number")
         ("addr,a", po::value<std::string>(&serverAddr), "bind address")
+        ("outfile,o", po::value<std::string>(&out_filename), "output filename for event timestamp record")
         ;
 
     po::variables_map vm;
@@ -152,6 +187,8 @@ int main(int argc, char* argv[])
         return 0;
     }
 
+
+    // Create udp socket with io_context
     boost::asio::io_context io_context;
     udp::resolver resolver(io_context);
     std::cout << "Server: " << serverAddr << " Port: " << serverPort << std::endl;
@@ -160,18 +197,25 @@ int main(int argc, char* argv[])
     udp::socket socket(io_context);
     socket.open(udp::v4());
 
+    std::cout << "Trying to build udp connection with ip:" << serverAddr << " port:"<< serverPort << "\n\n";
 
+    std::cout << "udp message is the Xinput signal from the controller in the form of : \n";
+    std::cout << "udp:(v_horizontal) (v_vertical) (v_fwd) (thetadot_horizontal) (thetadot_vertical) (btnA) (btnB) (btnX) (btnY) \n\n";
 
+    // Open and create a file for event timestamp record
+    //std::ofstream outputFile;
+    //outputFile.open(out_filename+"_event-timestamp.csv", std::ios::out | std::ios::app); // Creates or append to the event-timestamp.csv
     
     // Inquiry the controller for every ACCESS_PERIOD time and send the messages through the socket created
     boost::asio::io_context io_access_controller;
-    timer_wrapper access_loop(io_access_controller, ACCESS_PERIOD, process_XInput, &socket, &receiver_endpoint);
+    timer_wrapper access_loop(io_access_controller, ACCESS_PERIOD, process_XInput, &socket, &receiver_endpoint, out_filename);
+    //timer_wrapper access_loop(io_access_controller, ACCESS_PERIOD, process_XInput, &socket, &receiver_endpoint);
     access_loop.run();
     io_access_controller.run();
 
 
     // Close socket if needed
-
+    
 
     return 0;
 }
@@ -179,10 +223,10 @@ int main(int argc, char* argv[])
 
 
 
-bool process_XInput(udp::socket* skt, udp::endpoint* rcv_end) {
+bool process_XInput(udp::socket* skt, udp::endpoint* rcv_end, std::ofstream& outputFile, bool& running_flag) {
     DWORD controller_idx = NULL;
 
-    auto loop_start = Clock::now();
+    //auto loop_start = Clock::now();
     //auto loop_start = std::chrono::steady_clock::now();
 
     for (DWORD i = 0; i < MAX_USER_COUNT; i++)
@@ -199,6 +243,7 @@ bool process_XInput(udp::socket* skt, udp::endpoint* rcv_end) {
             //std::cout << "Controller " << i << " is connected!!\n"; //debug use
             XINPUT_GAMEPAD* pad_input = &controller_state.Gamepad;
             bool ctl_trig = false;
+            int ctl_event = 0;     // check what event is for the Xinput signal. 0: not used, 1:move event, 2:go home
 
             //// Buttons control ////
 
@@ -219,22 +264,25 @@ bool process_XInput(udp::socket* skt, udp::endpoint* rcv_end) {
             //bool pad_Lthumb = pad_input->wButtons & XINPUT_GAMEPAD_LEFT_THUMB;  //this is the thumb press button 
             //bool pad_Rthumb = pad_input->wButtons & XINPUT_GAMEPAD_RIGHT_THUMB;
 
-            if (msg.btnA) {
-                std::cout << "Button A is pressed \n";
+            if (msg.btnA) {     // Button A is for go home command
+                std::cout << "Button A is pressed. \n";
+                std::cout << "Robot is going to home position ... \n";
                 ctl_trig = true;
+                ctl_event = 2;
                 //std::cout << "Packet number : " << controller_state.dwPacketNumber << "\n\n";;
             }
-            else if (msg.btnB) {
+            else if (msg.btnB) {    //Currently not used
                 std::cout << "Button B is pressed \n";
                 ctl_trig = true;
                 //std::cout << "Packet number : " << controller_state.dwPacketNumber << "\n\n";;
             }
-            else if (msg.btnX) {
+            else if (msg.btnX) {    //Currently not used
                 std::cout << "Button X is pressed \n";
                 //std::cout << "Packet number : " << controller_state.dwPacketNumber << "\n\n";;
                 ctl_trig = true;
             }
-            else if (msg.btnY) {
+            else if (msg.btnY) {    // Button Y is for termination of program
+                std::cout << "Button Y is pressed. Program terminates ... \n";
                 return false;
             }
 
@@ -248,11 +296,13 @@ bool process_XInput(udp::socket* skt, udp::endpoint* rcv_end) {
                 // adjust magnitude relative to the thumbstick dead zone
                 msg.v_horizontal = Lthumb_X/ THUMB_MAX;
                 ctl_trig = true;
+                ctl_event = 1;
             }
             if (abs(Lthumb_Y) > LEFT_THUMB_DEADZONE) {
                 // adjust magnitude relative to the thumbstick dead zone
                 msg.v_vertical = Lthumb_Y/ THUMB_MAX;
                 ctl_trig = true;
+                ctl_event = 1;
             }
 
             //// Right Thumb stick control ////
@@ -264,11 +314,13 @@ bool process_XInput(udp::socket* skt, udp::endpoint* rcv_end) {
                 // adjust magnitude relative to the thumbstick dead zone
                 msg.thetadot_horizontal = Rthumb_X/ THUMB_MAX;
                 ctl_trig = true;
+                ctl_event = 1;
             }
             if (abs(Rthumb_Y) > RIGHT_THUMB_DEADZONE) {
                 // adjust magnitude relative to the thumbstick dead zone
                 msg.thetadot_vertical = Rthumb_Y/ THUMB_MAX;
                 ctl_trig = true;
+                ctl_event = 1;
             }
 
             
@@ -280,6 +332,7 @@ bool process_XInput(udp::socket* skt, udp::endpoint* rcv_end) {
                 // adjust magnitude relative to the Trigger dead zone
                 msg.v_fwd = msg.v_fwd / TRIGGER_MAX;
                 ctl_trig = true;
+                ctl_event = 1;
             }
 
 
@@ -288,10 +341,34 @@ bool process_XInput(udp::socket* skt, udp::endpoint* rcv_end) {
             if (ctl_trig) {
                 std::ostringstream ssout;
                 ssout << msg;
-                std::cout << ssout.str() << std::endl;
+                std::cout << "udp :" << ssout.str() << std::endl;
                 std::string send_buf(ssout.str());
                 skt->send_to(boost::asio::buffer(send_buf), *rcv_end);
-                std::cout << "Sent the message" << std::endl;
+                //std::cout << "Sent the message" << std::endl;
+                
+                if (ctl_event == 1) {    // Check if the robot control is a movement to trigger the event record
+                    if (!running_flag) {    // check if the robot is running or not. If not, then mark the current time as robot start event
+
+                        // Current time to seconds since epoch
+                        auto epoch_s = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            Clock::now().time_since_epoch()
+                        ).count();
+                        outputFile << epoch_s << ", 0, 1,\n";
+                        running_flag = true;
+                    }
+                }
+                else if (ctl_event == 2) {  // Checck if go home is triggered.
+                    if (running_flag) {    // check if the robot is running or not. If yes, then mark the current time as robot go home event
+                        auto epoch_s = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            Clock::now().time_since_epoch()
+                        ).count();
+                        outputFile << epoch_s << ", 0, 0,\n";
+                        std::this_thread::sleep_for(std::chrono::seconds(3)); // let this thread wait for 3 second for robot to go back to home position
+                        // Current time to seconds since epoch
+                        running_flag = false;
+                    }
+                }
+                    
             }
             
         }
